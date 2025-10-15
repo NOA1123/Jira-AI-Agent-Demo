@@ -1,0 +1,288 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>AI-Powered Jira Agent – Full</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <style>
+    :root { --bg:#0b0d10; --card:#12161b; --fg:#eaeef3; --muted:#9aa4af; --line:#1d232b; }
+    body { background: var(--bg); color: var(--fg); font-family: Inter, system-ui, Segoe UI, Roboto, sans-serif; margin: 24px; }
+    h1 { margin-bottom: 4px; font-size: 24px; }
+    p.muted { color: var(--muted); margin-top: 0; }
+    .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 16px; margin: 12px 0; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { border: 1px solid var(--line); padding: 8px; text-align: left; vertical-align: top; }
+    th { background: #141a21; }
+    .row { display: flex; gap: 12px; flex-wrap: wrap; }
+    button { padding: 10px 14px; border-radius: 10px; border: 1px solid var(--line); background: #19202a; color: var(--fg); cursor: pointer; }
+    button:hover { background: #202938; }
+    button:disabled { opacity:.55; cursor:not-allowed; }
+    input { background: #0f1318; color: var(--fg); border: 1px solid var(--line); border-radius: 8px; padding: 8px; }
+    .chip { display:inline-block; padding:2px 8px; border:1px solid var(--line); border-radius:999px; color: var(--muted); font-size:12px; }
+    #toast { position: fixed; right: 16px; bottom: 16px; background:#202938; border:1px solid var(--line); padding:10px 12px; border-radius:10px; display:none }
+  </style>
+</head>
+<body>
+  <h1>AI-Powered Jira Agent — Story & Test Case Generator</h1>
+  <p class="muted">Load features from Mock JSON or fetch Epics from Jira (configure backend <code>.env</code>). Then generate stories, tests, and export.</p>
+
+  <div id="toast"></div>
+
+  <div class="card">
+    <h3>1) Ingest Features</h3>
+    <div class="row">
+      <div>
+        <div class="chip">Option B · Mock JSON</div><br/>
+        <input type="file" id="mockfile" accept=".json,application/json"/>
+        <button id="btnUploadMock">Upload</button>
+      </div>
+      <div>
+        <div class="chip">Option A · Jira</div><br/>
+        <input id="jql" size="60" placeholder="project = AIDEMO AND issuetype = Epic ORDER BY created DESC"/>
+        <button id="btnFetchJira">Fetch</button>
+      </div>
+    </div>
+    <div id="features" style="margin-top:10px;"></div>
+  </div>
+
+  <div class="card">
+    <h3>2) Generate User Stories</h3>
+    <button id="btnGenStories" disabled>Generate Stories</button>
+    <div id="stories" style="margin-top:10px;"></div>
+  </div>
+
+  <div class="card">
+    <h3>3) Generate Test Cases</h3>
+    <button id="btnGenTests" disabled>Generate Tests</button>
+    <div id="tests" style="margin-top:10px;"></div>
+  </div>
+
+  <div class="card">
+    <h3>4) Export</h3>
+    <button id="btnExportJSON" disabled>Export JSON</button>
+    <button id="btnExportCSV"  disabled>Export CSV</button>
+    <button id="btnExportMD"   disabled>Export Markdown</button>
+  </div>
+
+<script>
+/* === Config === */
+const API = "http://127.0.0.1:8000";           // or http://localhost:8000
+const jqlDefault = "project = AIDEMO AND issuetype = Epic ORDER BY created DESC";
+
+/* === State === */
+let features = [];
+let stories  = [];
+let tests    = [];
+
+/* === UI helpers === */
+function esc(s){ return (s ?? "").toString().replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m])); }
+function toast(msg, ms=1800){ const t = document.getElementById('toast'); t.textContent = msg; t.style.display='block'; clearTimeout(t._h); t._h=setTimeout(()=>t.style.display='none', ms); }
+function setDisabled(id, val){ const el = document.getElementById(id); if(el) el.disabled = !!val; }
+function setAfterFeaturesLoaded(){
+  setDisabled('btnGenStories', features.length===0);
+  setDisabled('btnGenTests',   true);
+  setDisabled('btnExportJSON', false);  // allow exporting features-only JSON if you want
+  setDisabled('btnExportCSV',  true);
+  setDisabled('btnExportMD',   true);
+}
+function setAfterStoriesGenerated(){
+  setDisabled('btnGenTests',   stories.length===0);
+  setDisabled('btnExportJSON', false);
+  setDisabled('btnExportCSV',  true);
+  setDisabled('btnExportMD',   true);
+}
+function setAfterTestsGenerated(){
+  setDisabled('btnExportJSON', false);
+  setDisabled('btnExportCSV',  false);
+  setDisabled('btnExportMD',   false);
+}
+
+/* === Network helper (better errors) === */
+async function apiFetch(path, opts={}) {
+  const res  = await fetch(API + path, opts);
+  const text = await res.text();
+  let data;
+  try { data = JSON.parse(text); } catch { data = text; }
+  if (!res.ok) throw new Error(typeof data === 'string' ? data : (data.error || res.statusText));
+  if (typeof data === 'object' && data.error) throw new Error(data.error);
+  return data;
+}
+
+/* === Ingest: Mock JSON === */
+async function uploadMock(){
+  try {
+    const f = document.getElementById('mockfile').files[0];
+    if(!f) return alert('Choose a JSON file first.');
+    const fd = new FormData();
+    fd.append('file', f);
+    toast('Uploading mock JSON...');
+    const j = await apiFetch('/ingest/mock', { method:'POST', body:fd });
+    features = j.features || [];
+    renderFeatures(features);
+    toast(`Loaded ${j.count ?? features.length} feature(s).`);
+    setAfterFeaturesLoaded();
+  } catch (e) { alert('Mock upload failed: ' + e.message); }
+}
+
+/* === Ingest: Jira === */
+async function ingestJira(){
+  try {
+    const jqlInput = document.getElementById('jql').value.trim();
+    const jql = jqlInput || jqlDefault;
+    toast('Fetching Epics from Jira...');
+    const j = await apiFetch('/ingest/jira', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ jql })
+    });
+    features = j.features || [];
+    renderFeatures(features);
+    toast(`Fetched ${j.count ?? features.length} Epic(s).`);
+    setAfterFeaturesLoaded();
+  } catch (e) { alert('Jira fetch failed: ' + e.message); }
+}
+
+/* === Generate Stories === */
+async function generateStories(){
+  try {
+    if(!features.length) return alert('Load features first (mock or Jira).');
+    toast('Generating stories...');
+    const j = await apiFetch('/generate/stories', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ features })
+    });
+    stories = j.stories || [];
+    renderStories(stories);
+    toast(`Generated ${j.count ?? stories.length} storie(s).`);
+    setAfterStoriesGenerated();
+  } catch (e) { alert('Generate stories failed: ' + e.message); }
+}
+
+/* === Generate Tests === */
+async function generateTests(){
+  try {
+    if(!stories.length) return alert('Generate stories first.');
+    toast('Generating test cases...');
+    const j = await apiFetch('/generate/tests', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ stories })
+    });
+    tests = j.tests || [];
+    renderTests(tests);
+    toast(`Generated ${j.count ?? tests.length} test case(s).`);
+    setAfterTestsGenerated();
+  } catch (e) { alert('Generate tests failed: ' + e.message); }
+}
+
+/* === Export === */
+async function exportJSON(){
+  try {
+    const j = await apiFetch('/export?fmt=json');
+    const blob = new Blob([JSON.stringify(j, null, 2)], {type:'application/json'});
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'export.json';
+    a.click();
+    URL.revokeObjectURL(a.href);
+    toast('Exported JSON');
+  } catch(e){ alert('Export JSON failed: ' + e.message); }
+}
+
+async function exportCSV(){
+  try {
+    const res = await fetch(API + '/export?fmt=csv');
+    const txt = await res.text();
+    if (!res.ok) throw new Error(txt || res.statusText);
+    const blob = new Blob([txt], {type:'text/csv'});
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'export.csv';
+    a.click();
+    URL.revokeObjectURL(a.href);
+    toast('Exported CSV');
+  } catch(e){ alert('Export CSV failed: ' + e.message); }
+}
+
+async function exportMD(){
+  try {
+    const j = await apiFetch('/export?fmt=md');
+    const md = (j && j.markdown) ? j.markdown : '# No content';
+    const blob = new Blob([md], {type:'text/markdown'});
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'export.md';
+    a.click();
+    URL.revokeObjectURL(a.href);
+    toast('Exported Markdown');
+  } catch(e){ alert('Export MD failed: ' + e.message); }
+}
+
+/* === Renderers === */
+function renderFeatures(list){
+  const el = document.getElementById('features');
+  if(!list.length){ el.innerHTML = '<p class="muted">No features loaded.</p>'; return; }
+  let html = '<table><tr><th>ID</th><th>Key</th><th>Title</th><th>Description</th></tr>';
+  for(const f of list){
+    html += `<tr>
+      <td>${esc(f.id||'')}</td>
+      <td>${esc(f.key||'')}</td>
+      <td><b>${esc(f.title||'')}</b></td>
+      <td>${esc(f.description||'')}</td>
+    </tr>`;
+  }
+  html += '</table>';
+  el.innerHTML = html;
+}
+
+function renderStories(list){
+  const el = document.getElementById('stories');
+  if(!list.length){ el.innerHTML = '<p class="muted">No stories.</p>'; return; }
+  let html = '<table><tr><th>ID</th><th>Feature</th><th>Title</th><th>Description</th><th>AC</th><th>Points</th></tr>';
+  for(const s of list){
+    const desc = `As a ${esc(s.description?.asA)} I want ${esc(s.description?.iWant)} so that ${esc(s.description?.soThat)}`;
+    const acHtml = (s.acceptanceCriteria||[]).map(a=>`<div>G:${esc(a.given)} · W:${esc(a.when)} · T:${esc(a.then)}</div>`).join('');
+    html += `<tr>
+      <td>${esc(s.id||'')}</td>
+      <td>${esc(s.featureId||'')}</td>
+      <td><b>${esc(s.title||'')}</b></td>
+      <td>${desc}</td>
+      <td>${acHtml}</td>
+      <td>${esc(s.storyPoints||'')}</td>
+    </tr>`;
+  }
+  html += '</table>';
+  el.innerHTML = html;
+}
+
+function renderTests(list){
+  const el = document.getElementById('tests');
+  if(!list.length){ el.innerHTML = '<p class="muted">No tests.</p>'; return; }
+  let html = '<table><tr><th>ID</th><th>Story</th><th>Preconditions</th><th>Steps</th><th>Expected</th></tr>';
+  for(const t of list){
+    const steps = (t.steps||[]).map(s => `<div>${esc(s)}</div>`).join('');
+    html += `<tr>
+      <td>${esc(t.id)}</td>
+      <td>${esc(t.storyId||'')}</td>
+      <td>${esc(t.preconditions||'')}</td>
+      <td>${steps}</td>
+      <td>${esc(t.expected||'')}</td>
+    </tr>`;
+  }
+  html += '</table>';
+  el.innerHTML = html;
+}
+
+/* === Wire buttons === */
+document.getElementById('btnUploadMock').addEventListener('click', uploadMock);
+document.getElementById('btnFetchJira').addEventListener('click', ingestJira);
+document.getElementById('btnGenStories').addEventListener('click', generateStories);
+document.getElementById('btnGenTests').addEventListener('click', generateTests);
+document.getElementById('btnExportJSON').addEventListener('click', exportJSON);
+document.getElementById('btnExportCSV').addEventListener('click', exportCSV);
+document.getElementById('btnExportMD').addEventListener('click', exportMD);
+</script>
+</body>
+</html>
+

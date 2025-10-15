@@ -1,0 +1,14 @@
+[
+  {
+    "id": "F-001",
+    "key": "EPIC-101",
+    "title": "Checkout System",
+    "description": "Customers can pay with card or wallet; include confirmation and error handling."
+  },
+  {
+    "id": "F-002",
+    "key": "EPIC-102",
+    "title": "User Authentication",
+    "description": "Signup, login, password reset; block brute force; email confirmation."
+  }
+]
